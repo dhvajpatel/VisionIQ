@@ -61,21 +61,25 @@ logger.info("Models cache: %s (exists=%s)", MODELS_CACHE, MODELS_CACHE.exists())
 ANIMAL_CLASS_MAX_INDEX = 397
 
 # MTCNN minimum detection confidence.
-FACE_CONFIDENCE_THRESHOLD = 0.85
+# Lower threshold = more faces detected (catches partially occluded/tilted faces)
+FACE_CONFIDENCE_THRESHOLD = 0.75
 
-# Cap faces per image to bound CPU time on free tier.
-MAX_FACES = 8
+# Cap faces per image — raised to handle large group photos
+MAX_FACES = 20
 
-# Crop padding fractions
-FACE_PAD_X     = 0.20
-FACE_PAD_Y_TOP = 0.15
-FACE_PAD_Y_BOT = 0.05
+# Crop padding fractions — more padding gives the model more facial context
+FACE_PAD_X     = 0.25   # 25% each side — captures ears and hair
+FACE_PAD_Y_TOP = 0.20   # 20% above — captures forehead/hair
+FACE_PAD_Y_BOT = 0.10   # 10% below — captures chin
 
 # Context crop: extend below chin (fraction of face height)
-BODY_CONTEXT_FACTOR = 0.5
+# Reduced — clothing adds noise for gender classification
+BODY_CONTEXT_FACTOR = 0.25
 
-# Temperature sharpening (T < 1 → more decisive confidence scores)
-SHARPEN_TEMPERATURE = 0.65
+# Temperature sharpening — raised closer to 1.0 to avoid over-confident wrong predictions
+# T=0.65 was too aggressive: a 60% confidence would become 95%+ causing wrong labels
+# T=0.85 is gentler: only strongly confident predictions get amplified
+SHARPEN_TEMPERATURE = 0.85
 
 # Minimum crop dimension in pixels
 MIN_CROP_SIZE = 32
@@ -163,6 +167,14 @@ class VisionIQEngine:
 
     def _gender_scores(self, crop: Image.Image) -> dict:
         """Run ViT-B/16 (float16) on crop → normalised {'Male': p, 'Female': p}."""
+        # Upscale small crops — ViT works better with larger inputs
+        # The model was trained on 224x224; small faces lose detail at that resolution
+        if crop.width < 112 or crop.height < 112:
+            scale = max(112 / crop.width, 112 / crop.height)
+            new_w = max(int(crop.width  * scale), 112)
+            new_h = max(int(crop.height * scale), 112)
+            crop  = crop.resize((new_w, new_h), Image.LANCZOS)
+
         inputs = self.gender_processor(images=crop, return_tensors="pt")
         # Cast inputs to float16 to match model weights
         inputs = {k: v.half() if v.dtype == torch.float32 else v
@@ -195,21 +207,29 @@ class VisionIQEngine:
 
     def _classify_gender(self, face_crop: Image.Image, ctx_crop: Image.Image) -> Tuple[str, float]:
         """
-        Average ViT-B/16 scores over face crop + context crop, then sharpen.
-        Two crops on one model ≈ same accuracy as one crop on two models,
-        but uses half the RAM.
+        Run ViT-B/16 on face crop (primary) and context crop (secondary).
+        Weight face crop more heavily — it has cleaner facial features.
+        Only use context crop as a tiebreaker for near-50/50 cases.
         """
         sf = self._gender_scores(face_crop)
         sc = self._gender_scores(ctx_crop)
 
-        avg_m = (sf["Male"]   + sc["Male"])   / 2
-        avg_f = (sf["Female"] + sc["Female"]) / 2
+        # Weight face crop 70%, context crop 30%
+        # (context crop was causing errors by including clothing from other people)
+        avg_m = sf["Male"]   * 0.70 + sc["Male"]   * 0.30
+        avg_f = sf["Female"] * 0.70 + sc["Female"] * 0.30
         total = avg_m + avg_f
         if total > 1e-6:
             avg_m /= total
             avg_f /= total
 
-        sharp_m, sharp_f = self._sharpen(avg_m, avg_f)
+        # Only sharpen if there is clear confidence (>= 55%)
+        # — avoids flipping uncertain predictions to wrong label at high confidence
+        if max(avg_m, avg_f) >= 0.55:
+            sharp_m, sharp_f = self._sharpen(avg_m, avg_f)
+        else:
+            sharp_m, sharp_f = avg_m, avg_f
+
         label = "Female" if sharp_f >= sharp_m else "Male"
         return label, round(sharp_f if label == "Female" else sharp_m, 4)
 
